@@ -117,6 +117,22 @@ def test_queue_time_clips_and_merges_authorized_pauses():
     assert decision.evidence["remaining_minutes"] == 20
 
 
+def test_queue_time_replaying_pauses_does_not_deduct_them_again():
+    replayed_pause = TimeBox(110, 130)
+    decision = queue_time_decision(
+        QueueLimit("ETCH", 80, 3),
+        100,
+        200,
+        [replayed_pause, TimeBox(120, 150), replayed_pause, TimeBox(190, 210)],
+    )
+
+    assert decision.evidence["queue_paused_minutes"] == 50
+    assert decision.evidence["remaining_minutes"] == 30
+    assert decision.evidence["queue_limit_minutes"] - (
+        decision.evidence["queue_elapsed_minutes"] - decision.evidence["queue_paused_minutes"]
+    ) == decision.evidence["remaining_minutes"]
+
+
 def test_dispatch_excludes_held_and_frozen_lots_and_breaks_ties_stably():
     candidates = [
         DispatchCandidate("LOT-B", 1, 2),
@@ -269,6 +285,31 @@ def test_commit_ledger_is_atomic_idempotent_and_excludes_unavailable_units():
 def test_material_readiness_combines_queue_and_chemical_clocks():
     decision = material_readiness(QueueLimit("ETCH", 80, 2), 100, 200, [TimeBox(110, 130)], 100, 90, [TimeBox(110, 130)])
     assert decision.allowed and decision.evidence["remaining_minutes"] == 0 and decision.evidence["remaining_shelf_hours"] == 10
+
+
+def test_material_readiness_keeps_queue_pauses_and_chemical_freezes_separate():
+    shared_pause = TimeBox(110, 130)
+    decision = material_readiness(
+        QueueLimit("ETCH", 80, 2),
+        100,
+        200,
+        [shared_pause, shared_pause],
+        100,
+        50,
+        [TimeBox(140, 180)],
+    )
+
+    assert decision.reasons == ("chemical_shelf_life_expired",)
+    assert decision.evidence["queue_elapsed_minutes"] == 100
+    assert decision.evidence["queue_paused_minutes"] == 20
+    assert decision.evidence["remaining_minutes"] == 0
+    assert decision.evidence["chemical_elapsed_hours"] == 100
+    assert decision.evidence["chemical_frozen_hours"] == 40
+    assert decision.evidence["chemical_effective_age_hours"] == 60
+    assert decision.evidence["remaining_shelf_hours"] == -10
+    assert decision.evidence["shelf_limit_hours"] - (
+        decision.evidence["chemical_elapsed_hours"] - decision.evidence["chemical_frozen_hours"]
+    ) == decision.evidence["remaining_shelf_hours"]
 
 
 def test_rank_releasable_applies_hold_decisions_before_dispatch():

@@ -38,16 +38,13 @@ def queue_time_decision(
         return deny("evaluation_precedes_entry", limit_revision=limit.revision)
     elapsed = evaluated_at - entered_at
     paused = 0 if elapsed == 0 else covered_duration(authorized_pauses, TimeBox(entered_at, evaluated_at))
-    seen: set[TimeBox] = set()
-    for pause in authorized_pauses:
-        if pause in seen and elapsed:
-            overlap = pause.intersection(TimeBox(entered_at, evaluated_at))
-            paused += overlap.duration if overlap else 0
-        seen.add(pause)
     remaining = remaining_minutes(limit.max_minutes, elapsed, paused)
     evidence = {
         "route_step": limit.route_step,
         "limit_revision": limit.revision,
+        "queue_limit_minutes": limit.max_minutes,
+        "queue_elapsed_minutes": elapsed,
+        "queue_paused_minutes": paused,
         "elapsed_minutes": elapsed,
         "paused_minutes": paused,
         "remaining_minutes": remaining,

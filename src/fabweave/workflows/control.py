@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from fabweave.chamber.matching import Tolerance, mismatch_reasons
-from fabweave.chemicals.shelf_life import shelf_life_remaining
+from fabweave.chemicals.shelf_life import effective_age, shelf_life_remaining
 from fabweave.cleanroom.excursion import active_excursion
 from fabweave.contamination.segregation import incompatible_pairs
 from fabweave.core.decision import Decision, allow, deny
@@ -44,8 +44,16 @@ def material_readiness(
     frozen_periods: list[TimeBox],
 ) -> Decision:
     queue = queue_time_decision(queue_limit, entered_at, evaluated_at, queue_pauses)
-    remaining = shelf_life_remaining(opened_at, shelf_hours, evaluated_at, queue_pauses)
-    chemical = deny("chemical_shelf_life_expired", remaining_shelf_hours=remaining) if remaining < 0 else allow(remaining_shelf_hours=remaining)
+    effective_chemical_age = effective_age(opened_at, evaluated_at, frozen_periods)
+    remaining = shelf_life_remaining(opened_at, shelf_hours, evaluated_at, frozen_periods)
+    chemical_evidence = {
+        "shelf_limit_hours": shelf_hours,
+        "chemical_elapsed_hours": evaluated_at - opened_at,
+        "chemical_frozen_hours": (evaluated_at - opened_at) - effective_chemical_age,
+        "chemical_effective_age_hours": effective_chemical_age,
+        "remaining_shelf_hours": remaining,
+    }
+    chemical = deny("chemical_shelf_life_expired", **chemical_evidence) if remaining < 0 else allow(**chemical_evidence)
     return _combine([queue, chemical])
 
 
