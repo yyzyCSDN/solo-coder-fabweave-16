@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from fabweave.chamber.matching import Tolerance, mismatch_reasons
-from fabweave.chemicals.shelf_life import shelf_life_remaining
+from fabweave.chemicals.shelf_life import shelf_life_decision
 from fabweave.cleanroom.excursion import active_excursion
 from fabweave.contamination.segregation import incompatible_pairs
 from fabweave.core.decision import Decision, allow, deny
@@ -43,10 +43,17 @@ def material_readiness(
     shelf_hours: int,
     frozen_periods: list[TimeBox],
 ) -> Decision:
+    # The two clocks run from independent sources: queue pauses only suspend
+    # queue-time waiting, while chemical freezes only suspend shelf-life
+    # aging. Never feed one clock's intervals into the other.
     queue = queue_time_decision(queue_limit, entered_at, evaluated_at, queue_pauses)
-    remaining = shelf_life_remaining(opened_at, shelf_hours, evaluated_at, queue_pauses)
-    chemical = deny("chemical_shelf_life_expired", remaining_shelf_hours=remaining) if remaining < 0 else allow(remaining_shelf_hours=remaining)
-    return _combine([queue, chemical])
+    chemical = shelf_life_decision(opened_at, shelf_hours, evaluated_at, frozen_periods)
+    combined = _combine(
+        [queue, chemical],
+        queue_time={key: value for key, value in queue.evidence.items()},
+        chemical_shelf_life={key: value for key, value in chemical.evidence.items()},
+    )
+    return combined
 
 
 def rank_releasable(

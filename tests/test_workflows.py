@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from fabweave.chamber.matching import Tolerance, mismatch_reasons
-from fabweave.chemicals.shelf_life import effective_age, shelf_life_remaining
+from fabweave.chemicals.shelf_life import effective_age, shelf_life_decision, shelf_life_remaining
 from fabweave.cleanroom.excursion import active_excursion, excursion_periods
 from fabweave.contamination.segregation import incompatible_pairs, sequence_compatible
 from fabweave.core.decision import allow, deny
@@ -117,6 +117,33 @@ def test_queue_time_clips_and_merges_authorized_pauses():
     assert decision.evidence["remaining_minutes"] == 20
 
 
+def test_queue_time_replayed_pause_is_deducted_once():
+    limit = QueueLimit("ETCH", 80, 3)
+    pause = TimeBox(110, 130)
+    once = queue_time_decision(limit, 100, 200, [pause])
+    replayed = queue_time_decision(limit, 100, 200, [pause, pause, pause])
+    assert replayed.evidence["paused_minutes"] == once.evidence["paused_minutes"] == 20
+    assert replayed.evidence["remaining_minutes"] == 0
+    assert replayed.evidence["pause_windows"] == ((110, 130),)
+    # the merged window list lets the verdict be recomputed from raw evidence
+    evidence = replayed.evidence
+    assert evidence["max_minutes"] - (evidence["elapsed_minutes"] - evidence["paused_minutes"]) == evidence["remaining_minutes"]
+
+
+def test_queue_time_overlapping_pauses_are_unioned_before_deduction():
+    decision = queue_time_decision(
+        QueueLimit("ETCH", 80, 3),
+        100,
+        200,
+        [TimeBox(80, 110), TimeBox(105, 130), TimeBox(120, 140), TimeBox(190, 220), TimeBox(190, 220)],
+    )
+    # union clipped to [100, 200): [100,140)=40 plus [190,200)=10
+    assert decision.evidence["pause_windows"] == ((100, 140), (190, 200))
+    assert decision.evidence["paused_minutes"] == 50
+    assert decision.evidence["remaining_minutes"] == 30
+
+
+
 def test_dispatch_excludes_held_and_frozen_lots_and_breaks_ties_stably():
     candidates = [
         DispatchCandidate("LOT-B", 1, 2),
@@ -198,6 +225,27 @@ def test_chemical_age_merges_and_clips_freeze_periods():
     assert shelf_life_remaining(0, 5, 10, periods) == 3
 
 
+def test_chemical_freeze_replay_and_overlaps_count_once():
+    decision = shelf_life_decision(100, 90, 200, [TimeBox(110, 130), TimeBox(110, 130), TimeBox(120, 140)])
+    assert decision.evidence["freeze_windows"] == ((110, 140),)
+    assert decision.evidence["frozen_hours"] == 30
+    assert decision.evidence["age_hours"] == 70
+    assert decision.evidence["remaining_shelf_hours"] == 20
+    evidence = decision.evidence
+    assert evidence["shelf_hours"] - evidence["age_hours"] == evidence["remaining_shelf_hours"]
+    assert evidence["age_hours"] == evidence["evaluated_at"] - evidence["opened_at"] - evidence["frozen_hours"]
+
+
+def test_chemical_shelf_life_expires_without_freeze_evidence():
+    decision = shelf_life_decision(100, 90, 200, [])
+    assert not decision.allowed
+    assert decision.reasons == ("chemical_shelf_life_expired",)
+    assert decision.evidence["frozen_hours"] == 0
+    assert decision.evidence["age_hours"] == 100
+    assert decision.evidence["remaining_shelf_hours"] == -10
+
+
+
 def test_cleanroom_event_time_dedup_and_hysteresis():
     assert excursion_periods([(2, 6), (1, 5), (2, 6), (3, 1)], 4, 2) == [(1, 3)]
     assert active_excursion([(1, 6), (2, 6), (3, 3), (4, 6)], 5, 4, 2, 2)
@@ -269,6 +317,42 @@ def test_commit_ledger_is_atomic_idempotent_and_excludes_unavailable_units():
 def test_material_readiness_combines_queue_and_chemical_clocks():
     decision = material_readiness(QueueLimit("ETCH", 80, 2), 100, 200, [TimeBox(110, 130)], 100, 90, [TimeBox(110, 130)])
     assert decision.allowed and decision.evidence["remaining_minutes"] == 0 and decision.evidence["remaining_shelf_hours"] == 10
+
+
+def test_material_readiness_isolates_queue_pauses_from_chemical_clock():
+    # Queue pause [110,130) exists only for the queue-time clock; the chemical
+    # has no freeze record, so its 100h age against a 90h shelf must expire.
+    decision = material_readiness(
+        QueueLimit("ETCH", 80, 2), 100, 200, [TimeBox(110, 130)],
+        100, 90, [],
+    )
+    assert decision.reasons == ("chemical_shelf_life_expired",)
+    queue = decision.evidence["queue_time"]
+    chemical = decision.evidence["chemical_shelf_life"]
+    assert queue["paused_minutes"] == 20 and queue["remaining_minutes"] == 0
+    assert queue["pause_windows"] == ((110, 130),)
+    assert chemical["frozen_hours"] == 0 and chemical["age_hours"] == 100
+    assert chemical["remaining_shelf_hours"] == -10
+    assert chemical["freeze_windows"] == ()
+    # each clock can be recomputed independently from its own evidence block
+    assert queue["max_minutes"] - (queue["elapsed_minutes"] - queue["paused_minutes"]) == queue["remaining_minutes"]
+    assert chemical["shelf_hours"] - chemical["age_hours"] == chemical["remaining_shelf_hours"]
+
+
+def test_material_readiness_isolates_chemical_freezes_from_queue_clock():
+    # A chemical freeze [110,140) must not suspend queue waiting: elapsed 100
+    # against an 80-minute limit breaches, while the chemical stays usable.
+    decision = material_readiness(
+        QueueLimit("ETCH", 80, 2), 100, 200, [],
+        100, 90, [TimeBox(110, 140)],
+    )
+    assert decision.reasons == ("queue_time_breached",)
+    queue = decision.evidence["queue_time"]
+    chemical = decision.evidence["chemical_shelf_life"]
+    assert queue["paused_minutes"] == 0 and queue["remaining_minutes"] == -20
+    assert chemical["frozen_hours"] == 30 and chemical["age_hours"] == 70
+    assert chemical["remaining_shelf_hours"] == 20
+
 
 
 def test_rank_releasable_applies_hold_decisions_before_dispatch():

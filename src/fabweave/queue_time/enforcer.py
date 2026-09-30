@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fabweave.core.decision import Decision, allow, deny
-from fabweave.core.timebox import TimeBox, covered_duration
+from fabweave.core.timebox import TimeBox, merge_timeboxes
 
 
 def remaining_minutes(max_minutes: float, elapsed_minutes: float, paused_minutes: float = 0.0) -> float:
@@ -36,20 +36,30 @@ def queue_time_decision(
 ) -> Decision:
     if evaluated_at < entered_at:
         return deny("evaluation_precedes_entry", limit_revision=limit.revision)
+
     elapsed = evaluated_at - entered_at
-    paused = 0 if elapsed == 0 else covered_duration(authorized_pauses, TimeBox(entered_at, evaluated_at))
-    seen: set[TimeBox] = set()
-    for pause in authorized_pauses:
-        if pause in seen and elapsed:
-            overlap = pause.intersection(TimeBox(entered_at, evaluated_at))
-            paused += overlap.duration if overlap else 0
-        seen.add(pause)
+    if elapsed == 0:
+        effective_pauses: list[TimeBox] = []
+    else:
+        window = TimeBox(entered_at, evaluated_at)
+        # Replays may append the very same TimeBox more than once, and
+        # separately recorded pauses may overlap. Clip to the queue window
+        # first and merge before measuring, so every covered minute is
+        # counted at most once.
+        clipped = [part for pause in authorized_pauses if (part := pause.intersection(window))]
+        effective_pauses = merge_timeboxes(clipped)
+    paused = sum(interval.duration for interval in effective_pauses)
+
     remaining = remaining_minutes(limit.max_minutes, elapsed, paused)
     evidence = {
         "route_step": limit.route_step,
         "limit_revision": limit.revision,
+        "entered_at": entered_at,
+        "evaluated_at": evaluated_at,
+        "max_minutes": limit.max_minutes,
         "elapsed_minutes": elapsed,
         "paused_minutes": paused,
         "remaining_minutes": remaining,
+        "pause_windows": tuple((interval.start, interval.end) for interval in effective_pauses),
     }
     return deny("queue_time_breached", **evidence) if remaining < 0 else allow(**evidence)
